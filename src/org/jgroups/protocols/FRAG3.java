@@ -304,7 +304,7 @@ public class FRAG3 extends Protocol {
                 frag_table.remove(hdr.id);
                 if(log.isTraceEnabled())
                     log.trace("%s: unfragmented message from %s (size=%d) from %d fragments",
-                              local_addr, sender, assembled_msg.getLength(), entry.number_of_frags_recvd);
+                              local_addr, sender, assembled_msg.getLength(), entry.num_frags);
             }
         }
         finally {
@@ -324,11 +324,6 @@ public class FRAG3 extends Protocol {
      * All methods are unsynchronized, use getLock() to obtain a lock for concurrent access.
      */
     protected static class FragEntry {
-        // each fragment is a byte buffer
-        final Message fragments[];
-        //the number of fragments we have received
-        int number_of_frags_recvd=0;
-
         protected final Lock lock=new ReentrantLock();
 
         // the message to be passed up; fragments write their payloads into the buffer at the correct offsets
@@ -343,8 +338,6 @@ public class FRAG3 extends Protocol {
          * @param num_frags the number of fragments expected for this message
          */
         protected FragEntry(int num_frags) {
-            fragments=new Message[num_frags];
-
             this.num_frags=num_frags;
             received=new FixedSizeBitSet(num_frags);
         }
@@ -365,13 +358,6 @@ public class FRAG3 extends Protocol {
          */
         // todo: make this thread safe
         public void set(Message frag_msg, Frag3Header hdr) {
-            // don't count an already received fragment (should not happen though because the
-            // reliable transmission protocol(s) below should weed out duplicates
-            if(fragments[hdr.frag_id] == null) {
-                fragments[hdr.frag_id]=frag_msg;
-                number_of_frags_recvd++;
-            }
-
             if(buffer == null)
                 buffer=new byte[hdr.original_length];
 
@@ -434,7 +420,7 @@ public class FRAG3 extends Protocol {
 
         public String toString() {
             StringBuilder ret=new StringBuilder();
-            ret.append("[tot_frags=").append(fragments.length).append(", number_of_frags_recvd=").append(number_of_frags_recvd).append(']');
+            ret.append("[tot_frags=").append(num_frags).append(", number_of_frags_recvd=").append(received.cardinality()).append(']');
             return ret.toString();
         }
 
