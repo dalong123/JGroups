@@ -10,6 +10,7 @@ import org.jgroups.annotations.ManagedOperation;
 import org.jgroups.annotations.Property;
 import org.jgroups.stack.Protocol;
 import org.jgroups.util.AverageMinMax;
+import org.jgroups.util.FixedSizeBitSet;
 import org.jgroups.util.MessageBatch;
 import org.jgroups.util.Util;
 
@@ -240,7 +241,6 @@ public class FRAG3 extends Protocol {
             }
 
             int frag_id=getNextId(); // used as the common ID for all fragments of this message
-
             int total_size=original_length + msg.getOffset();
             int offset=msg.getOffset();
             int tmp_size=0, i=0;
@@ -251,49 +251,21 @@ public class FRAG3 extends Protocol {
                 else
                     tmp_size=total_size - offset;
 
+                Frag3Header hdr=new Frag3Header(frag_id, i, num_frags, original_length,
+                                                offset - msg.getOffset()); // at the receiver, offset needs to start at 0!!
+
                 // don't copy the buffer, only src, dest and headers. Only copy the headers for the first fragment!
-                Message frag_msg=msg.copy(false, i == 0).setBuffer(buffer, offset, tmp_size);
-                Frag3Header hdr=new Frag3Header(frag_id, i, num_frags, original_length, offset);
-                frag_msg.putHeader(this.id, hdr);
+                Message frag_msg=msg.copy(false, i == 0).setBuffer(buffer, offset, tmp_size).putHeader(this.id, hdr);
                 down_prot.down(frag_msg);
                 offset+=tmp_size;
                 i++;
             }
         }
         catch(Exception e) {
-            log.error("%s: fragmentation failure: %s", local_addr, e);
+            log.error(String.format("%s: fragmentation failure", local_addr), e);
         }
     }
 
-
-    /*protected void fragment(Message msg) {
-            try {
-                byte[] buffer=msg.getRawBuffer();
-                final List<Range> fragments=Util.computeFragOffsets(msg.getOffset(), msg.getLength(), frag_size);
-                int num_frags=fragments.size();
-                num_frags_sent.add(num_frags);
-
-                if(log.isTraceEnabled()) {
-                    Address dest=msg.getDest();
-                    log.trace("%s: fragmenting message to %s (size=%d) into %d fragment(s) [frag_size=%d]",
-                              local_addr, dest != null ? dest : "<all>", msg.getLength(), num_frags, frag_size);
-                }
-
-                int frag_id=getNextId(); // used as a seqno
-                for(int i=0; i < num_frags; i++) {
-                    Range r=fragments.get(i);
-                    // don't copy the buffer, only src, dest and headers. Only copy the headers one time !
-                    Message frag_msg=msg.copy(false, i == 0);
-                    frag_msg.setBuffer(buffer, (int)r.low, (int)r.high);
-                    Frag3Header hdr=new Frag3Header(frag_id, i, num_frags);
-                    frag_msg.putHeader(this.id, hdr);
-                    down_prot.down(frag_msg);
-                }
-            }
-            catch(Exception e) {
-                log.error("%s: fragmentation failure: %s", local_addr, e);
-            }
-        }*/
 
 
     /**
@@ -326,7 +298,7 @@ public class FRAG3 extends Protocol {
 
         entry.lock();
         try {
-            entry.set(hdr.frag_id, msg);
+            entry.set(msg, hdr);
             if(entry.isComplete()) {
                 assembled_msg=entry.assembleMessage();
                 frag_table.remove(hdr.id);
@@ -359,13 +331,22 @@ public class FRAG3 extends Protocol {
 
         protected final Lock lock=new ReentrantLock();
 
+        // the message to be passed up; fragments write their payloads into the buffer at the correct offsets
+        protected       Message         msg;
+        protected       byte[]          buffer;
+        protected final int             num_frags; // number of expected fragments
+        protected final FixedSizeBitSet received;
+
 
         /**
          * Creates a new entry
-         * @param tot_frags the number of fragments to expect for this message
+         * @param num_frags the number of fragments expected for this message
          */
-        protected FragEntry(int tot_frags) {
-            fragments=new Message[tot_frags];
+        protected FragEntry(int num_frags) {
+            fragments=new Message[num_frags];
+
+            this.num_frags=num_frags;
+            received=new FixedSizeBitSet(num_frags);
         }
 
         /** Use to synchronize on FragEntry */
@@ -380,33 +361,37 @@ public class FRAG3 extends Protocol {
         /**
          * adds on fragmentation buffer to the message
          * @param frag_id the number of the fragment being added 0..(tot_num_of_frags - 1)
-         * @param frag the byte buffer containing the data for this fragmentation, should not be null
+         * @param frag_msg the byte buffer containing the data for this fragmentation, should not be null
          */
-        public void set(int frag_id, Message frag) {
+        // todo: make this thread safe
+        public void set(Message frag_msg, Frag3Header hdr) {
             // don't count an already received fragment (should not happen though because the
             // reliable transmission protocol(s) below should weed out duplicates
-            if(fragments[frag_id] == null) {
-                fragments[frag_id]=frag;
+            if(fragments[hdr.frag_id] == null) {
+                fragments[hdr.frag_id]=frag_msg;
                 number_of_frags_recvd++;
+            }
+
+            if(buffer == null)
+                buffer=new byte[hdr.original_length];
+
+            if(hdr.frag_id == 0) {
+                // special treatment: the first fragment creates the message, copy the headers but not the buffer
+                msg=frag_msg.copy(false);
+            }
+
+
+            if(received.set(hdr.frag_id)) {
+                // if not yet added: copy the fragment's buffer into msg.buffer at the correct offset
+                int frag_length=frag_msg.getLength();
+                int offset=hdr.offset;
+                System.arraycopy(frag_msg.getRawBuffer(), frag_msg.getOffset(), buffer, offset, frag_length);
             }
         }
 
-        /** returns true if this fragmentation is complete
-         *  ie, all fragmentations have been received for this buffer
-         *
-         */
+        /** Returns true if this fragmentation is complete, ie all fragments have been received for this buffer */
         public boolean isComplete() {
-            /*first make a simple check*/
-            if(number_of_frags_recvd < fragments.length) {
-                return false;
-            }
-            /*then double check just in case*/
-            for(Message msg: fragments) {
-                if(msg == null)
-                    return false;
-            }
-            /* have all fragments been received */
-            return true;
+            return received.cardinality() == num_frags;
         }
 
         /**
@@ -418,6 +403,10 @@ public class FRAG3 extends Protocol {
          *
          */
         protected Message assembleMessage() {
+            return msg.setBuffer(buffer);
+        }
+
+        /*protected Message assembleMessage() {
             Message retval;
             byte[]  combined_buffer, tmp;
             int     combined_length=0, length, offset;
@@ -441,7 +430,7 @@ public class FRAG3 extends Protocol {
 
             retval.setBuffer(combined_buffer);
             return retval;
-        }
+        }*/
 
         public String toString() {
             StringBuilder ret=new StringBuilder();
