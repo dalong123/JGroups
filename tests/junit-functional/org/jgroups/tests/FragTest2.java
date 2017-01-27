@@ -66,7 +66,8 @@ public class FragTest2 {
           new UNICAST3(),
           new STABLE(),
           new GMS().joinTimeout(1000),
-          new FRAG2().fragSize(20)
+          // new FRAG2().fragSize(20)
+          new FRAG3().fragSize(20)
           // new FRAG().setValue("frag_size", 20)
         ).name(name);
     }
